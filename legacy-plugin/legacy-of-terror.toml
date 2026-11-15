@@ -1,0 +1,48 @@
+# Legacy of Terror plugin: an offline copy of Blizzard's Diablo 30th anniversary event.
+# Close the game before editing; changes apply on the next start.
+# With the "I Hate TOMLs" plugin installed, every setting can also be changed in game.
+# Console (Ctrl + `): "terror" shows the status, "terror clone" makes the next Super Unique
+# in this Hell game Diablo Clone, "terror cows" retries the Cow Portal.
+# Terror Zones everywhere come from the Legacy of Terror D2RMM mod, not from this file.
+
+[diablo_clone]
+# Diablo Clone takes the place of the next Super Unique you meet, in Hell only, at fixed
+# times every few hours, as on Battle.net. Only a Hell game that is running at that moment
+# gets him (as online); "Diablo Walks the Earth" is shown when he comes.
+enabled = true
+# The schedule, in UTC hours: the first time of day, and the hours between two spawns.
+# The defaults are what the event used: 02:00, 08:00, 14:00 and 20:00 UTC
+# (midnight, 6 AM, noon and 6 PM Pacific).
+first_hour_utc = 2
+every_hours = 6
+
+[cow_portal]
+# A Cow Portal opens in the Rogue Encampment, beside the camp fire, in every game on a
+# difficulty where you have killed Baal. No Wirt's Leg needed. The game's own rule of one
+# Cow Portal per game still applies (the cube recipe will not open a second one).
+enabled = true
+# Where, from the camp fire, in the game's position units (about a third of a floor tile).
+# Higher x moves it down-right on screen, higher y down-left; 4 and -4 is to the right.
+# The game moves it to the nearest free spot if something stands there.
+offset_x = 4
+offset_y = -4
+
+[hell_bovines]
+# Slain monsters sometimes rise as a Hell Bovine that fights for you, then falls after a while.
+# Only corpses a Necromancer could revive can rise.
+enabled = true
+# Chance for each kill, in percent (1-5).
+chance_percent = 3
+# Seconds each Hell Bovine stays before it dies (30-60).
+lifetime_seconds = 60
+
+[magic_find]
+# Every character starts each game with this much Magic Find (0-250), at all difficulties.
+# It shows on the character screen and adds to your gear's Magic Find; the game's usual
+# diminishing returns then apply to the total. Nothing is saved to the character.
+bonus_percent = 100
+
+[vendors]
+# Added to "Reduces all Vendor Prices" for every player: buying, gambling and repairs.
+# Selling to a vendor is not affected. The game caps the total at 99%.
+discount_percent = 15

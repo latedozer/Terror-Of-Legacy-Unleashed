@@ -1,0 +1,22 @@
+{
+  "name": "Legacy of Terror (offline)",
+  "description": "Offline copy of Blizzard's Diablo 30th anniversary event. This mod holds the data half: every zone terrorized at once (after Baal, toggled with the Terrorized box when you create a game) and the Hell Bovine Minion pet type. The Legacy of Terror plugin (d2rl-legacy-of-terror.dll) does the rest: Diablo Clone every six hours in Hell, the Cow Portal in the Rogue Encampment, +100% Magic Find, 15% off at vendors and gamblers, and Hell Bovine Minions.",
+  "author": "Latedozer",
+  "version": "1.0.0",
+  "config": [
+    {
+      "id": "allZones",
+      "type": "checkbox",
+      "name": "Terror Zones everywhere",
+      "description": "Every zone that can be terrorized is terrorized at the same time, on each difficulty where you have killed Baal. Untick the Terrorized box in the game creation (gear) menu to play a game without them.",
+      "defaultValue": true
+    },
+    {
+      "id": "bovines",
+      "type": "checkbox",
+      "name": "Hell Bovine Minion pet type",
+      "description": "Adds the pet type the plugin gives to reanimated Hell Bovines, so they follow you like a Necromancer's revives without showing in the party frame, and do not count against anyone's other pets. Leave on when you use the plugin.",
+      "defaultValue": true
+    }
+  ]
+}

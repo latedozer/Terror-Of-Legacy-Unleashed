@@ -1,0 +1,9 @@
+# build output
+build/
+*.dll
+*.exe
+*.o
+# release folders and archives (published by hand)
+Release*/
+release-*/
+*.zip
