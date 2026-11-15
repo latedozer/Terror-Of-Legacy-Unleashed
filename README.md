@@ -17,7 +17,8 @@ An offline copy of Blizzard's Diablo 30th anniversary event (November 2026). Two
 - **Cow Portal.** In the Rogue Encampment a red portal to the Cow Level opens beside the camp
   fire, once Baal is dead on that difficulty (`offset_x` / `offset_y` move it). No Wirt's Leg. Killing the Cow King does not lock you out.
 - **Hell Bovine Minions.** A slain monster sometimes rises as a Hell Bovine that fights the
-  monsters around it (it does not follow you) and falls after a while (3% and 60 s by default; 1-5% and 30-60 s in the settings). Only
+  monsters around it (it does not follow you) and falls after a while (3% and 60 s by default; 1-5% and 30-60 s in the settings). Like the
+  monsters a Necromancer revives, they rise with +200% life (`life_bonus_percent`). Only
   corpses a Necromancer could revive can rise. They stay out of the party frame.
 - **Base 100% Magic Find** for every character (shown on the character screen, on top of your gear's MF, nothing saved).
 - **15% off** buying, gambling and repairs (added to "Reduces all Vendor Prices"). Selling is unchanged.

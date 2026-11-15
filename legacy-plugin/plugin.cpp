@@ -74,6 +74,7 @@ struct Config {
 	int bovineEnabled  = 1;
 	int bovineChance   = 3;
 	int bovineLife     = 60;
+	int bovineBonus    = 200; // extra life, % (Revive's own +200%)
 	int mfBonus        = 100;
 	int discount       = 15;
 };
@@ -108,6 +109,7 @@ const Setting kSettings[] = {
 	{ "hell_bovines", "enabled", &g_config.bovineEnabled, true, 0, 1, 0, "Slain monsters rise as Hell Bovines", "They fight for you." },
 	{ "hell_bovines", "chance_percent", &g_config.bovineChance, false, 1, 5, 1, "Chance per kill (%)", nullptr },
 	{ "hell_bovines", "lifetime_seconds", &g_config.bovineLife, false, 30, 60, 5, "Seconds before each falls", nullptr },
+	{ "hell_bovines", "life_bonus_percent", &g_config.bovineBonus, false, 0, 400, 25, "Extra life (%)", "As a Necromancer's Revive: raised monsters get +200% life." },
 	{ nullptr, nullptr, nullptr, false, 0, 0, 0, "Magic Find and vendors", nullptr },
 	{ "magic_find", "bonus_percent", &g_config.mfBonus, false, 0, 250, 10, "Base Magic Find (%)", "Every character has this much Magic Find to begin with; it shows on the character screen." },
 	{ "vendors", "discount_percent", &g_config.discount, false, 0, 99, 1, "Vendor and gambling discount (%)", "Added to Reduces all Vendor Prices; selling is not affected." },
@@ -389,6 +391,7 @@ using KillFn         = void (*)(Game* game, Unit* victim, Unit* killer, int32_t 
 using RoomForgetFn   = void (*)(Room* room, uint32_t type, uint32_t id);
 using RemoveUnitFn   = void (*)(Game* game, Unit* unit);
 using StatFn         = int32_t (*)(Unit* unit, uint32_t stat, uint32_t layer);
+using MaxLifeFn     = int32_t (*)(Unit* unit);
 using SetStatFn      = void (*)(Unit* unit, uint32_t stat, int32_t value, uint16_t layer);
 using NextInRoomFn   = Unit* (*)(Unit* unit);
 using FindSpotFn     = int32_t (*)(Game* game, Room* room, int32_t* xy, int32_t radius, int32_t collision, Room** found, int32_t a, int32_t b);
@@ -405,7 +408,7 @@ struct EngineFunction {
 enum : int {
 	kBroadcast, kPlayerCount, kOpenCow, kGameQuestGet, kPlayerData, kQuestGet, kIterPlayers, kUnitRoom, kRoomLevel, kFindUnit, kUnitOwner, kCreatePet,
 	kPetToClient, kPlayerClient, kPetFinish, kOwnerValue, kCorpseOk, kCorpseOk2, kUnitPos, kKill, kRoomForget, kRemoveUnit, kGetStat,
-	kNextInRoom, kFindSpot, kMakePortal, kGameQuestSet, kSetStat, kFunctionCount
+	kNextInRoom, kFindSpot, kMakePortal, kGameQuestSet, kSetStat, kMaxLife, kFunctionCount
 };
 
 const EngineFunction kFunctions[kFunctionCount] = {
@@ -439,6 +442,8 @@ const EngineFunction kFunctions[kFunctionCount] = {
 	{ "MakePortal", 0x432ce0, { 0x48, 0x8b, 0xc4, 0x48, 0x89, 0x68, 0x20, 0x56, 0x57, 0x41, 0x55, 0x41 }, 12 },
 	{ "GameQuestSet", 0x5181c0, { 0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48 }, 12 },
 	{ "SetStat", 0x2f7d10, { 0xff, 0x25 }, 2 },
+	// a unit's full max life, read by the summon skills before they add their life bonus (0x55f35f)
+	{ "MaxLife", 0x2f4d20, { 0xff, 0x25 }, 2 },
 };
 bool g_functionOk[kFunctionCount] = {};
 
@@ -495,6 +500,7 @@ std::atomic<int> g_clonesTriggered { 0 };
 std::atomic<int> g_cowPortals { 0 };
 std::atomic<int> g_bovinesRaised { 0 };
 std::atomic<int> g_bovinesAlive { 0 };
+std::atomic<int> g_bovinesFellEarly { 0 }; // killed before their time
 std::atomic<int> g_lastCloneResult { 0 }; // 0 none yet, 1 pending, 2 not Hell, 3 already, 4 no players
 std::atomic<int> g_ticks { 0 };
 
@@ -764,6 +770,19 @@ bool RaiseBovine(Game* game, const PendingRise& rise) {
 	if (pet == nullptr) {
 		return true;
 	}
+	// The life a summon skill adds (0x55f333): the skill's calc1 in percent on top of the
+	// pet's max life, written to max life and life. For Revive calc1 is 200 (plus Skeleton
+	// Mastery), so a revived monster has three times its life; without it the cows rose with
+	// a plain Hell Bovine's life and fell in a few hits among many monsters.
+	if (g_config.bovineBonus > 0 && Have({ kMaxLife, kSetStat })) {
+		const int64_t base = Engine<MaxLifeFn>(kMaxLife)(pet);
+		int64_t       life = base + base * g_config.bovineBonus / 100;
+		life               = life > 0x7fffffff ? 0x7fffffff : life;
+		if (base > 0) {
+			Engine<SetStatFn>(kSetStat)(pet, 7, static_cast<int32_t>(life), 0);
+			Engine<SetStatFn>(kSetStat)(pet, 6, static_cast<int32_t>(life), 0);
+		}
+	}
 	// what the summon skills do next (0x55c3b1): tell the owner's client, finish the pet
 	if (void* client = Engine<PlayerClientFn>(kPlayerClient)(owner)) {
 		Engine<PetToClientFn>(kPetToClient)(client, pet);
@@ -795,6 +814,9 @@ void BovineTick(Game* game) {
 	for (int i = 0; i < g_minionCount;) {
 		Unit* unit = Engine<FindUnitFn>(kFindUnit)(game, 1, g_minions[i].id);
 		bool  drop = unit == nullptr || UnitMode(unit) == kModeDeath || UnitMode(unit) == kModeDead;
+		if (drop) {
+			++g_bovinesFellEarly;
+		}
 		if (!drop && static_cast<int32_t>(frame - g_minions[i].until) >= 0) {
 			Engine<KillFn>(kKill)(game, unit, nullptr, 0); // they fall after their time
 			drop = true;
@@ -1147,10 +1169,10 @@ D2RL::ConsoleCommandResult __cdecl OnConsole(D2R::Game::Client*, const D2RL::Con
 		const char*   clone  = g_lastCloneResult == 1 ? "pending/spawned" : g_lastCloneResult == 2 ? "last mark: not a Hell game" : g_lastCloneResult == 3 ? "last mark: already had him"
 			: g_lastCloneResult == 4 ? "last mark: no players" : "none yet";
 		snprintf(text, sizeof(text),
-			"Legacy of Terror: diablo clone %s (next in %lldh %02lldm, %s, %d so far), cow portal %s (%d opened), hell bovines %s (%d%%, %ds, %d raised, %d up), base magic find %s (%d%%), vendors %s (-%d%%). Commands: terror clone | cows",
+			"Legacy of Terror: diablo clone %s (next in %lldh %02lldm, %s, %d so far), cow portal %s (%d opened), hell bovines %s (%d%%, %ds, +%d%% life, %d raised, %d up, %d slain early), base magic find %s (%d%%), vendors %s (-%d%%). Commands: terror clone | cows",
 			g_cloneReady && g_config.cloneEnabled ? "on" : "off", static_cast<long long>(wait / 3600), static_cast<long long>((wait / 60) % 60), clone, g_clonesTriggered.load(),
 			g_cowReady && g_config.cowEnabled ? "on" : "off", g_cowPortals.load(), g_bovineReady && g_config.bovineEnabled ? "on" : "off", g_config.bovineChance, g_config.bovineLife,
-			g_bovinesRaised.load(), g_bovinesAlive.load(), g_mfReady ? "on" : "off", g_mfActive.load(), g_priceReady ? "on" : "off", g_discountActive.load());
+			g_config.bovineBonus, g_bovinesRaised.load(), g_bovinesAlive.load(), g_bovinesFellEarly.load(), g_mfReady ? "on" : "off", g_mfActive.load(), g_priceReady ? "on" : "off", g_discountActive.load());
 		g_ctx->WriteConsoleMessage(text);
 	}
 	return D2RL::ConsoleCommandResult::Handled;

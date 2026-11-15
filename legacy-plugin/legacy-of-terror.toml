@@ -35,6 +35,9 @@ enabled = true
 chance_percent = 3
 # Seconds each Hell Bovine stays before it dies (30-60).
 lifetime_seconds = 60
+# Extra life for each Hell Bovine, in percent (0-400). The game's Revive gives the monsters it
+# raises +200%; the Hell Bovines get the same, or they fall in a few hits among many monsters.
+life_bonus_percent = 200
 
 [magic_find]
 # Every character starts each game with this much Magic Find (0-250), at all difficulties.
