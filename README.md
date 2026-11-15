@@ -32,16 +32,6 @@ Settings: `d2rloader/config/legacy-of-terror.toml` (or the I Hate TOMLs menu in 
 Console (Ctrl + `): `terror` shows the status, `terror clone` brings Diablo Clone now (Hell),
 `terror cows` tries the Cow Portal again.
 
-## Not yet seen in game
-
-Checked against the game's code, not yet confirmed in play:
-- Whether the terror zone schedule is happy with a single zone holding every level.
-- Where the Cow Portal lands beside the camp fire.
-- Hell Bovines with the Act 5 barbarians' AI (fighting nearby monsters without following you).
-  The cow has no run animation, which that AI may ask for.
-- Base Magic Find on the character screen.
-- The "Diablo Walks the Earth" message offline.
-
 ## Build and test
 
 Needs mingw-w64 (`x86_64-w64-mingw32-g++`), the [D2RLoader Plugin SDK](https://github.com/D2RLoader/PluginSDK)
