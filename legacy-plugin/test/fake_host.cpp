@@ -136,22 +136,37 @@ bool __cdecl InstallInlineHook(const D2RL::PluginContext*, const D2RL::InlineHoo
 }
 
 // stand-ins for the game, put in place after the plugin's checks
-int32_t FakeStat(void*, uint32_t stat, uint32_t) { return stat == 80 ? 50 : stat == 87 ? 10 : 0; }
 int32_t FakePlayerCount(void*) { return 1; }
 uint32_t g_fakePlayer[0x100] = { 0, 0, 7 }; // the server's copy: type 0, id 7
 uint32_t g_clientCopy[0x100] = { 0, 0, 7 };  // the client's copy, in the client's unit table
 int      g_setStats = 0, g_setValue = 0, g_clientSets = 0, g_clientValue = 0;
 uint32_t g_setStat = 0, g_setLayer = 99;
+int32_t  g_serverBase = 0, g_clientBase = 0; // base Magic Find of each copy
+constexpr int32_t kGearMf = 30;              // and what the gear adds, on both
+// the stat reader gives a stat with the gear included, as the game's does
+int32_t FakeStat(void* unit, uint32_t stat, uint32_t) {
+	if (stat == 87) {
+		return 10;
+	}
+	if (stat != 80) {
+		return 0;
+	}
+	return (unit == g_clientCopy ? g_clientBase : unit == g_fakePlayer ? g_serverBase : 0) + kGearMf;
+}
 void FakeSetStat(void* unit, uint32_t stat, int32_t value, uint16_t layer) {
 	if (unit == g_clientCopy && stat == 80 && layer == 0) {
 		++g_clientSets;
 		g_clientValue = value;
+		g_clientBase  = value;
 	}
 	if (unit == g_fakePlayer) {
 		++g_setStats;
 		g_setStat  = stat;
 		g_setValue = value;
 		g_setLayer = layer;
+		if (stat == 80 && layer == 0) {
+			g_serverBase = value;
+		}
 	}
 }
 using PlayerCb = void (*)(void*, void*, void*);
@@ -291,9 +306,33 @@ int main(int argc, char** argv) {
 	Check(g_clientSets == 1 && g_clientValue == 100, "the client's copy of the player gets the same 100 (for the character screen)");
 	*reinterpret_cast<uint32_t*>(game.data() + 0x170) = 75;
 	tick(game.data());
+	Check(g_uiJobs.empty(), "and is not looked at again a second later");
 	for (auto& job : g_uiJobs) job.first(&context, job.second);
 	g_uiJobs.clear();
 	Check(g_clientSets == 1, "and is not written again every second");
+	// the game makes a new copy of the player, at the same place, without the base
+	g_clientBase = 0;
+	int looks    = 0;
+	for (uint32_t frame = 100; frame < 275; frame += 25) {
+		*reinterpret_cast<uint32_t*>(game.data() + 0x170) = frame;
+		tick(game.data());
+		looks += static_cast<int>(g_uiJobs.size());
+		for (auto& job : g_uiJobs) job.first(&context, job.second);
+		g_uiJobs.clear();
+	}
+	Check(looks == 0 && g_clientSets == 1, "no look at the copy within 10 seconds of the last");
+	*reinterpret_cast<uint32_t*>(game.data() + 0x170) = 275;
+	tick(game.data());
+	looks = static_cast<int>(g_uiJobs.size());
+	for (auto& job : g_uiJobs) job.first(&context, job.second);
+	g_uiJobs.clear();
+	Check(looks == 1 && g_clientSets == 2 && g_clientBase == 100, "10 seconds on, a copy that lost its 100 gets it back");
+	*reinterpret_cast<uint32_t*>(game.data() + 0x170) = 525;
+	tick(game.data());
+	looks = static_cast<int>(g_uiJobs.size());
+	for (auto& job : g_uiJobs) job.first(&context, job.second);
+	g_uiJobs.clear();
+	Check(looks == 1 && g_clientSets == 2, "and 10 seconds after that, a copy that shows the same as the server's is left alone");
 	Check(*reinterpret_cast<int32_t*>(game.data() + 0x1a5d4) == 0 && g_broadcasts == 0, "no clone at start-up (only when a six-hour mark passes)");
 	Console("clone");
 	*reinterpret_cast<uint32_t*>(game.data() + 0x170) = 26;

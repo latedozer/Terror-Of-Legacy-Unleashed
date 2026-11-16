@@ -536,6 +536,14 @@ constexpr int kMaxPlayers = 16;
 MfGiven       g_mfGiven[kMaxPlayers];
 int           g_mfGivenCount = 0;
 
+// The character screen's copy of the player (see "base Magic Find" below) is looked at when its
+// value changes and otherwise at most every 10 seconds.
+constexpr uint32_t   kClientLookFrames = 10 * 25;
+std::atomic<int32_t> g_serverMfTotal { INT32_MIN }; // the server copy's Magic Find, gear included (INT32_MIN = not known)
+uint32_t             g_clientAskedId    = 0xffffffffu; // server thread: what the last look was for...
+int32_t              g_clientAskedValue = INT32_MIN;
+uint32_t             g_clientNextLook   = 0;           // ...and the game frame of the next one
+
 
 void ResetGameState(Game* game) {
 	g_game         = game;
@@ -546,6 +554,10 @@ void ResetGameState(Game* game) {
 	g_pendingCount = 0;
 	g_minionCount  = 0;
 	g_bovinesAlive = 0;
+	g_serverMfTotal    = INT32_MIN;
+	g_clientAskedId    = 0xffffffffu; // the new game's player is looked at in its first second
+	g_clientAskedValue = INT32_MIN;
+	g_clientNextLook   = 0;
 }
 
 // ---------------------------------------------------------------- Diablo Clone
@@ -836,12 +848,15 @@ void BovineTick(Game* game) {
 // stat 80 to it, so the client's copy gets the same base value (on the UI thread). The client
 // keeps its players in a table of 128 lists at 0x2a23910 (next unit at +0x158), as found for
 // Horrors in the Night; the copy has the same unit id as the server's.
+// The game can make a new copy of the player (at the same place in memory, too), so the copy is
+// not taken at its word once written: each look compares its Magic Find, gear included, with the
+// server copy's, and puts the base back when they differ.
 const D2RL::ThreadService* g_threads = nullptr;
 std::atomic<uint32_t>      g_clientMfId { 0xffffffffu };
 std::atomic<int32_t>       g_clientMfValue { 0 };
 std::atomic<bool>          g_clientJobQueued { false };
-uintptr_t                  g_clientPlayer  = 0;  // UI thread only
-int32_t                    g_clientApplied = -1; // UI thread only
+std::atomic<int>           g_clientWrites { 0 }; // times the copy was given its base, for the console
+uintptr_t                  g_clientPlayer = 0;   // UI thread only
 
 bool SafeReadBytes(uintptr_t address, void* out, size_t size) {
 	SIZE_T done = 0;
@@ -874,26 +889,48 @@ void __cdecl ClientMfJob(const D2RL::PluginContext*, void*) noexcept {
 	g_clientJobQueued = false;
 	const uint32_t id    = g_clientMfId.load();
 	const int32_t  value = g_clientMfValue.load();
+	const int32_t  total = g_serverMfTotal.load();
 	if (id == 0xffffffffu) {
 		return;
 	}
 	uint32_t header[3] = {};
 	if (g_clientPlayer == 0 || !SafeReadBytes(g_clientPlayer, header, sizeof(header)) || header[0] != 0 || header[2] != id) {
-		g_clientPlayer  = FindClientPlayer(id);
-		g_clientApplied = -1;
+		g_clientPlayer = FindClientPlayer(id);
 	}
-	if (g_clientPlayer != 0 && g_clientApplied != value) {
-		Engine<SetStatFn>(kSetStat)(reinterpret_cast<Unit*>(g_clientPlayer), 80, value, 0);
-		g_clientApplied = value;
+	if (g_clientPlayer == 0) {
+		return;
+	}
+	Unit* const client = reinterpret_cast<Unit*>(g_clientPlayer);
+	// Without the server's total to compare with, the base is written at every look.
+	const bool known = total != INT32_MIN && g_functionOk[kGetStat];
+	if (!known || Engine<StatFn>(kGetStat)(client, 80, 0) != total) {
+		Engine<SetStatFn>(kSetStat)(client, 80, value, 0);
+		++g_clientWrites;
 	}
 }
 
-void QueueClientMf() {
-	if (g_threads != nullptr && g_clientMfId.load() != 0xffffffffu && !g_clientJobQueued.exchange(true)) {
-		if (g_threads->runOnUiThread(g_ctx, ClientMfJob, nullptr) != D2RL::Threads::Result::Success) {
-			g_clientJobQueued = false;
-		}
+// Server thread, once a second: a look at the client's copy when what it should show changed (a
+// new game, the setting), else when the last look is 10 seconds old.
+void QueueClientMf(uint32_t frame) {
+	const uint32_t id    = g_clientMfId.load();
+	const int32_t  value = g_clientMfValue.load();
+	if (g_threads == nullptr || id == 0xffffffffu) {
+		return;
 	}
+	const bool changed = id != g_clientAskedId || value != g_clientAskedValue;
+	if (!changed && static_cast<int32_t>(frame - g_clientNextLook) < 0) {
+		return;
+	}
+	if (g_clientJobQueued.exchange(true)) {
+		return; // the last look has not run yet
+	}
+	if (g_threads->runOnUiThread(g_ctx, ClientMfJob, nullptr) != D2RL::Threads::Result::Success) {
+		g_clientJobQueued = false;
+		return;
+	}
+	g_clientAskedId    = id;
+	g_clientAskedValue = value;
+	g_clientNextLook   = frame + kClientLookFrames;
 }
 
 void MfPlayer(Game*, Unit* player, void*) {
@@ -905,21 +942,27 @@ void MfPlayer(Game*, Unit* player, void*) {
 	if (g_clientMfId.load() == 0xffffffffu || g_mfGivenCount == 0) {
 		g_clientMfId = id; // the first player of the game is the one playing here
 	}
-	if (g_clientMfId.load() == id) {
+	const bool local = g_clientMfId.load() == id;
+	if (local) {
 		g_clientMfValue = value;
 	}
-	for (int i = 0; i < g_mfGivenCount; ++i) {
+	bool known = false;
+	for (int i = 0; i < g_mfGivenCount && !known; ++i) {
 		if (g_mfGiven[i].id == id) {
+			known = true;
 			if (g_mfGiven[i].value != value) {
 				Engine<SetStatFn>(kSetStat)(player, 80, value, 0);
 				g_mfGiven[i].value = value;
 			}
-			return;
 		}
 	}
-	if (g_mfGivenCount < kMaxPlayers) {
+	if (!known && g_mfGivenCount < kMaxPlayers) {
 		Engine<SetStatFn>(kSetStat)(player, 80, value, 0);
 		g_mfGiven[g_mfGivenCount++] = { id, value };
+	}
+	// what the character screen should show: the server copy's Magic Find with the gear
+	if (local && g_functionOk[kGetStat]) {
+		g_serverMfTotal = Engine<StatFn>(kGetStat)(player, 80, 0);
 	}
 }
 
@@ -951,7 +994,7 @@ uint64_t TickHook(Game* game) {
 		}
 		if (g_mfReady) {
 			Engine<IterPlayersFn>(kIterPlayers)(game, MfPlayer, nullptr);
-			QueueClientMf(); // cheap when nothing changed: one header read on the UI thread
+			QueueClientMf(frame);
 		}
 	}
 	return result;
@@ -1169,10 +1212,10 @@ D2RL::ConsoleCommandResult __cdecl OnConsole(D2R::Game::Client*, const D2RL::Con
 		const char*   clone  = g_lastCloneResult == 1 ? "pending/spawned" : g_lastCloneResult == 2 ? "last mark: not a Hell game" : g_lastCloneResult == 3 ? "last mark: already had him"
 			: g_lastCloneResult == 4 ? "last mark: no players" : "none yet";
 		snprintf(text, sizeof(text),
-			"Legacy of Terror: diablo clone %s (next in %lldh %02lldm, %s, %d so far), cow portal %s (%d opened), hell bovines %s (%d%%, %ds, +%d%% life, %d raised, %d up, %d slain early), base magic find %s (%d%%), vendors %s (-%d%%). Commands: terror clone | cows",
+			"Legacy of Terror: diablo clone %s (next in %lldh %02lldm, %s, %d so far), cow portal %s (%d opened), hell bovines %s (%d%%, %ds, +%d%% life, %d raised, %d up, %d slain early), base magic find %s (%d%%, character screen set %dx), vendors %s (-%d%%). Commands: terror clone | cows",
 			g_cloneReady && g_config.cloneEnabled ? "on" : "off", static_cast<long long>(wait / 3600), static_cast<long long>((wait / 60) % 60), clone, g_clonesTriggered.load(),
 			g_cowReady && g_config.cowEnabled ? "on" : "off", g_cowPortals.load(), g_bovineReady && g_config.bovineEnabled ? "on" : "off", g_config.bovineChance, g_config.bovineLife,
-			g_config.bovineBonus, g_bovinesRaised.load(), g_bovinesAlive.load(), g_bovinesFellEarly.load(), g_mfReady ? "on" : "off", g_mfActive.load(), g_priceReady ? "on" : "off", g_discountActive.load());
+			g_config.bovineBonus, g_bovinesRaised.load(), g_bovinesAlive.load(), g_bovinesFellEarly.load(), g_mfReady ? "on" : "off", g_mfActive.load(), g_clientWrites.load(), g_priceReady ? "on" : "off", g_discountActive.load());
 		g_ctx->WriteConsoleMessage(text);
 	}
 	return D2RL::ConsoleCommandResult::Handled;
@@ -1183,7 +1226,7 @@ constexpr D2RL::PluginInfo kPluginInfo {
 	.abiVersion  = D2RL_PLUGIN_ABI_VERSION,
 	.id          = "legacy-of-terror",
 	.name        = "Legacy of Terror",
-	.version     = "1.0.0",
+	.version     = "1.0.1",
 	.author      = "Latedozer",
 	.description = "Offline copy of the Diablo 30th anniversary event: Diablo Clone every six hours in Hell, a Cow Portal in the Rogue Encampment, +100% Magic Find, 15% off at vendors, and Hell Bovine Minions.",
 	.flags       = D2RL::PluginFlags::Shared | D2RL::PluginFlags::NativeHooks,
