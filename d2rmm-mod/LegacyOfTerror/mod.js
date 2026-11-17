@@ -103,7 +103,10 @@ const minionId = 'lot_bovineminion';
       if (/^(AI|aidel|aidist|aip\d)/.test(h)) row[h] = ally[h] ?? '';
       if (/^TreasureClass/.test(h)) row[h] = '';
     });
-    ['Align', 'inTown'].forEach((h) => {
+    // neverCount: every allied summon in the game's own file has it (Valkyrie, golems,
+    // skeletons, the barbarians). Without it the level counts the cow as one more monster to
+    // kill, and as an ally its death is never counted, so the Den of Evil never clears.
+    ['Align', 'inTown', 'neverCount'].forEach((h) => {
       if (monstats.headers.includes(h)) row[h] = ally[h] ?? '';
     });
     ['isSpawn', 'rarity'].forEach((h) => {
