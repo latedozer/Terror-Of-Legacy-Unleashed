@@ -139,7 +139,7 @@ bool __cdecl InstallInlineHook(const D2RL::PluginContext*, const D2RL::InlineHoo
 int32_t FakePlayerCount(void*) { return 1; }
 uint32_t g_fakePlayer[0x100] = { 0, 0, 7 }; // the server's copy: type 0, id 7
 uint32_t g_clientCopy[0x100] = { 0, 0, 7 };  // the client's copy, in the client's unit table
-int      g_setStats = 0, g_setValue = 0, g_clientSets = 0, g_clientValue = 0;
+int      g_setStats = 0, g_setValue = 0, g_clientSets = 0, g_clientValue = 0, g_priceSets = 0, g_priceValue = 0;
 uint32_t g_setStat = 0, g_setLayer = 99;
 int32_t  g_serverBase = 0, g_clientBase = 0; // base Magic Find of each copy
 constexpr int32_t kGearMf = 30;              // and what the gear adds, on both
@@ -159,7 +159,11 @@ void FakeSetStat(void* unit, uint32_t stat, int32_t value, uint16_t layer) {
 		g_clientValue = value;
 		g_clientBase  = value;
 	}
-	if (unit == g_fakePlayer) {
+	if (unit == g_fakePlayer && stat == 87 && layer == 0) {
+		++g_priceSets;
+		g_priceValue = value;
+	}
+	if (unit == g_fakePlayer && stat != 87) {
 		++g_setStats;
 		g_setStat  = stat;
 		g_setValue = value;
@@ -174,6 +178,19 @@ void FakeIterPlayers(void* game, PlayerCb callback, void* user) { callback(game,
 void    FakeBroadcast(void*, const void* packet) {
 	memcpy(g_packet, packet, sizeof(g_packet));
 	++g_broadcasts;
+}
+
+uint32_t g_fakeMonster[0x100] = { 1, 0, 77 };
+uint32_t g_findId = 0;
+void*    FakeFindUnit(void*, uint32_t, uint32_t id) {
+	g_findId = id;
+	return g_fakeMonster;
+}
+int      g_rangeCalls = 0, g_rangeSeen = 0;
+uint64_t FakePetRange(void*, void*, void*, int32_t distanceSquared) {
+	++g_rangeCalls;
+	g_rangeSeen = distanceSquared;
+	return 0;
 }
 
 // points a D2RCore stat thunk (ff 25 disp32) at a host function
@@ -217,6 +234,12 @@ int main(int argc, char** argv) {
 	memcpy(g_image, dump.data(), dump.size());
 	dump.clear();
 	dump.shrink_to_fit();
+	// "hooked" as a sixth argument: the pet creation routine starts with another plugin's jump
+	const bool hookedRun = argc > 6 && strcmp(argv[6], "hooked") == 0;
+	if (hookedRun) {
+		const uint8_t jump[5] = { 0xe9, 0x1b, 0xaf, 0xb9, 0xff };
+		memcpy(g_image + 0x4350e0, jump, sizeof(jump));
+	}
 
 	g_lifecycle.serviceSize                  = D2RL::LifecycleServiceSize;
 	g_lifecycle.serviceVersion               = D2RL::LifecycleService::AbiVersion;
@@ -265,7 +288,7 @@ int main(int argc, char** argv) {
 		"every part is on and every engine function matches the dump");
 	Check(g_log.find("pet type row 22 (Hell Bovine Minion)") != std::string::npos && g_log.find("Hell Bovine Minion is monster row") != std::string::npos
 		&& g_log.find("plain Hell Bovine") == std::string::npos, "the mod's numbers are read from info.tsv (the minion row and its pet type)");
-	Check(g_hooks.size() == 1 && g_hooks[0].rva == 0x488310, "the server tick hook is taken at 0x488310");
+	Check(g_hooks.size() == 2 && g_hooks[0].rva == 0x488310 && g_hooks[1].rva == 0x44db20, "the server tick hook is taken at 0x488310, and the kill routine is watched at 0x44db20");
 	Check(g_death != nullptr, "the monster death listener is registered");
 
 	// the two redirects
@@ -274,15 +297,37 @@ int main(int argc, char** argv) {
 		return site + 5 + static_cast<int64_t>(*reinterpret_cast<int32_t*>(g_image + site + 1));
 	};
 	Check(callTarget(0x44236c) == 0x2f5c60, "the drop code's Magic Find read is left as the game has it");
-	Check(callTarget(0x36f22b) == 0x3ecd80 && g_image[0x3ecd80] == 0xff && g_image[0x3ecd81] == 0x25, "vendor discount read goes to the padding jump");
-	Check(g_image[0x3ecd60] == 0xcc && g_image[0x3ecd8e] == 0xcc, "the jump stays inside its 14 bytes");
+	Check(callTarget(0x36f22b) == 0x2f5020 && g_image[0x3ecd80] == 0xcc, "the price code's Reduces Vendor Prices read is left as the game has it");
+	Check(g_image[0x3ecd6e] == 0xcc, "the jump stays inside its 14 bytes");
+	Check(callTarget(0x500caf) == 0x3ecd60 && g_image[0x3ecd60] == 0xff && g_image[0x3ecd61] == 0x25, "the range pets' warp call goes to the padding jump");
+	if (hookedRun) {
+		Check(g_log.find("engine: CreatePet (0x4350e0) is hooked by another plugin - used through its hook") != std::string::npos,
+			"a pet creation routine hooked by another plugin is recognised and still used");
+	}
+	{
+		// the warp distance: 0x501920 and the unit lookup replaced by stand-ins
+		Replace(0x501920, reinterpret_cast<void*>(&FakePetRange));
+		Replace(0x48fe80, reinterpret_cast<void*>(&FakeFindUnit));
+		const size_t at = g_log.find("Hell Bovine Minion is monster row ");
+		const int minion = at == std::string::npos ? -1 : atoi(g_log.c_str() + at + 34);
+		using RangeFn = uint64_t (*)(void*, void*, void*, int32_t);
+		const RangeFn range = reinterpret_cast<RangeFn>(g_image + 0x3ecd60);
+		struct Node { uint32_t flags, id; uint64_t a, b; void* next; } node { 0, 77, 0, 0, nullptr };
+		void* list[3] = { &node, nullptr, nullptr };
+		char  game[8] = {};
+		g_fakeMonster[1] = static_cast<uint32_t>(minion);
+		range(game, g_fakePlayer, list, 0x640);
+		Check(minion > 0 && g_rangeCalls == 1 && g_rangeSeen == 80 * 80 && g_findId == 77, "the Hell Bovines' list is checked at 200% of 40 steps (80 steps, squared)");
+		g_fakeMonster[1] = 412; // some other range pet (a trap)
+		range(game, g_fakePlayer, list, 0x640);
+		Check(g_rangeCalls == 2 && g_rangeSeen == 0x640, "any other pet type keeps the game's 40 steps");
+		void* empty[3] = {};
+		range(game, g_fakePlayer, empty, 0x640);
+		Check(g_rangeCalls == 3 && g_rangeSeen == 0x640, "an empty list is passed on untouched");
+	}
 
 	PointThunk(0x2f5020, reinterpret_cast<void*>(&FakeStat));
 	PointThunk(0x2f7d10, reinterpret_cast<void*>(&FakeSetStat));
-	using StatFn = int32_t (*)(void*, uint32_t, uint32_t);
-	const int32_t price = reinterpret_cast<StatFn>(g_image + 0x3ecd80)(nullptr, 87, 0);
-	printf("  [host] reduced prices 10 -> %d\n", price);
-	Check(price == 25, "a player with 10% reduced prices gets 25% in the price code");
 
 	// the tick and the clone
 	Replace(0x4251e0, reinterpret_cast<void*>(&FakePlayerCount));
@@ -299,7 +344,8 @@ int main(int argc, char** argv) {
 	Check(g_setStats == 1 && g_setStat == 80 && g_setValue == 100 && g_setLayer == 0, "each player gets base Magic Find 100 (stat 80, base layer)");
 	*reinterpret_cast<uint32_t*>(game.data() + 0x170) = 50;
 	tick(game.data());
-	Check(g_setStats == 1, "only once per game");
+	Check(g_priceSets == 1 && g_priceValue == 15, "and base Reduces all Vendor Prices 15 (stat 87, base layer)");
+	Check(g_setStats == 1 && g_priceSets == 1, "only once per game");
 	*reinterpret_cast<void**>(g_image + 0x2a23910 + 8 * 5) = g_clientCopy; // the client's players, list 5
 	for (auto& job : g_uiJobs) job.first(&context, job.second);
 	g_uiJobs.clear();

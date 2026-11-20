@@ -20,8 +20,10 @@ An offline copy of Blizzard's Diablo 30th anniversary event (November 2026). Two
   monsters around it (it does not follow you) and falls after a while (3% and 60 s by default; 1-5% and 30-60 s in the settings). Like the
   monsters a Necromancer revives, they rise with +200% life (`life_bonus_percent`). Only
   corpses a Necromancer could revive can rise. They stay out of the party frame.
+  They stay where they rose: when you warp (Teleport, a waypoint, a portal, stairs) those too far from
+  where you arrive fall, as traps and hydras do. `range_percent` sets how far (100 = the game's 40 steps, 200 by default).
 - **Base 100% Magic Find** for every character (shown on the character screen, on top of your gear's MF, nothing saved).
-- **15% off** buying, gambling and repairs (added to "Reduces all Vendor Prices"). Selling is unchanged.
+- **15% off** buying, gambling and repairs: every character has a base 15% "Reduces all Vendor Prices" (shown on the character screen, on top of your gear's, nothing saved). Selling is unchanged.
 
 ## Install
 

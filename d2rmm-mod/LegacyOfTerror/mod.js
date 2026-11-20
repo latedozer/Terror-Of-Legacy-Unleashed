@@ -45,9 +45,13 @@ if (config.allZones) {
 
 // ---------------------------------------------------------------------------
 // Hell Bovine Minion pet type: a copy of the Necromancer's "revive" row for their own count, but
-// with no portrait and no warp: like the Assassin's traps and the Sorceress' hydras (rows with
-// no warp, partysend, drawhp, icontype or icon) they stay where they rose and out of the party
-// frame.
+// with no portrait, and "range" instead of "warp": the Assassin's traps and the Sorceress' hydras
+// (rows with range and no warp, partysend, drawhp, icontype or icon) stay where they were made and
+// out of the party frame.
+// warp and range decide what the game does with a pet each time its owner warps (Teleport, a
+// waypoint, a portal, stairs): warp brings the pet along; range leaves it and removes it only when
+// it is more than 40 steps from where the owner arrived; a row with neither (only the Amazon's
+// Decoy) loses every pet at once. The cows had neither, so each Teleport or doorway killed them.
 const petFile = 'global\\excel\\pettype.txt';
 const pets = D2RMM.readTsv(petFile);
 const petName = 'lot_bovine';
@@ -57,9 +61,16 @@ if (config.bovines && !pets.rows.some((r) => r['pet type'] === petName)) {
     const row = Object.assign({}, revive);
     row['pet type'] = petName;
     row.name = 'LoTBovineMinion';
-    ['warp', 'range', 'partysend', 'drawhp', 'icontype', 'baseicon'].forEach((k) => {
+    ['warp', 'partysend', 'drawhp', 'icontype', 'baseicon'].forEach((k) => {
       if (k in row) row[k] = '';
     });
+    if ('range' in row) row.range = '1';
+    // basemax is how many pets of the type a player may have with no skill behind them (1 for
+    // the mercenary). Each time the game works the limits out again (an item picked up, moved or
+    // put on, a skill point spent) it removes the pets over the limit. The row copied Revive's 0,
+    // whose limit comes from the skill, so every Hell Bovine fell at the player's next item.
+    // 64 is the most the plugin keeps at once.
+    if ('basemax' in row) row.basemax = '64';
     Object.keys(row).forEach((k) => {
       if (/^(mclass|micon|overridename)\d+$/.test(k)) row[k] = '';
     });

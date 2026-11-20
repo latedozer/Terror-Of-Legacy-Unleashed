@@ -19,4 +19,7 @@ node test/run_mod.js ../d2rmm-mod/LegacyOfTerror/mod.js "$DATA" "$WORK/mod/TestM
 # the stand-in has no game to run the Cow Portal against
 awk 'BEGIN{s=""} /^\[/{s=$0} {if(s=="[cow_portal]" && $0=="enabled = true") print "enabled = false"; else print}' legacy-of-terror.toml > "$WORK/test.toml"
 cd build
-WINEDEBUG=-all timeout 300 wine fake_host.exe "$(winepath -w "$PWD/d2rl-legacy-of-terror.dll")" "$(winepath -w "$DUMP")" "$(winepath -w "$WORK/test.toml")" "$(winepath -w "$WORK/mod")" TestMod | grep -E '^(ok|FAIL|ALL|FAILURES)'
+run() { WINEDEBUG=-all timeout 300 wine fake_host.exe "$(winepath -w "$PWD/d2rl-legacy-of-terror.dll")" "$(winepath -w "$DUMP")" "$(winepath -w "$WORK/test.toml")" "$(winepath -w "$WORK/mod")" TestMod "$@" | grep -E '^(ok|FAIL|ALL|FAILURES)'; }
+run
+echo "-- again, with the pet creation routine hooked by another plugin"
+run hooked

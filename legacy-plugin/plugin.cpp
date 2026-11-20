@@ -19,10 +19,11 @@
 //    with the rest. Stat 80 is not a saved player stat, so nothing is written to the character.
 //    The server does not send stat 80 to the client, so the client's copy of the player is
 //    given the same value for the character screen.
-//  - Vendors: the price routine (0x36f0c0) reads "Reduces all Vendor Prices" (stat 87) at
-//    0x36f22b for buying, gambling and repairs. That one read gets the discount added.
-//  The price read is redirected through a 14-byte jump placed in unused padding (int3 bytes)
-//  of the game's code; every patch checks the bytes it replaces first.
+//  - Vendors: every player gets a base "Reduces all Vendor Prices" (stat 87, layer 0) the same
+//    way. The game's price routine (0x36f0c0) reads that stat for buying, gambling and repairs,
+//    so the discount is the game's own, and it shows on the character screen.
+//  The Hell Bovines' warp distance call is redirected through a 14-byte jump placed in unused
+//  padding (int3 bytes) of the game's code; every patch checks the bytes it replaces first.
 
 #include <D2RLPlugin/api.h>
 #include <D2RLPlugin/data_tables.h>
@@ -75,6 +76,7 @@ struct Config {
 	int bovineChance   = 3;
 	int bovineLife     = 60;
 	int bovineBonus    = 200; // extra life, % (Revive's own +200%)
+	int bovineRange    = 200; // how far a warp may leave them behind, % of the game's 40 steps
 	int mfBonus        = 100;
 	int discount       = 15;
 };
@@ -83,6 +85,7 @@ Config g_config;
 // what the hooks read from other threads
 std::atomic<int> g_mfActive { 0 };
 std::atomic<int> g_discountActive { 0 };
+std::atomic<int> g_bovineRangeActive { 100 };
 
 struct Setting {
 	const char* section;
@@ -110,9 +113,11 @@ const Setting kSettings[] = {
 	{ "hell_bovines", "chance_percent", &g_config.bovineChance, false, 1, 5, 1, "Chance per kill (%)", nullptr },
 	{ "hell_bovines", "lifetime_seconds", &g_config.bovineLife, false, 30, 60, 5, "Seconds before each falls", nullptr },
 	{ "hell_bovines", "life_bonus_percent", &g_config.bovineBonus, false, 0, 400, 25, "Extra life (%)", "As a Necromancer's Revive: raised monsters get +200% life." },
+	{ "hell_bovines", "range_percent", &g_config.bovineRange, false, 100, 1000, 25, "Distance they survive a warp (%)",
+		"When you Teleport or take a portal, Hell Bovines farther than this from where you arrive fall. 100 = 40 steps, as for traps and hydras." },
 	{ nullptr, nullptr, nullptr, false, 0, 0, 0, "Magic Find and vendors", nullptr },
 	{ "magic_find", "bonus_percent", &g_config.mfBonus, false, 0, 250, 10, "Base Magic Find (%)", "Every character has this much Magic Find to begin with; it shows on the character screen." },
-	{ "vendors", "discount_percent", &g_config.discount, false, 0, 99, 1, "Vendor and gambling discount (%)", "Added to Reduces all Vendor Prices; selling is not affected." },
+	{ "vendors", "discount_percent", &g_config.discount, false, 0, 99, 1, "Vendor and gambling discount (%)", "Every character has this much Reduces all Vendor Prices to begin with; it shows on the character screen. Selling is not affected." },
 };
 
 void SetSetting(const Setting& setting, int number) {
@@ -122,6 +127,7 @@ void SetSetting(const Setting& setting, int number) {
 void ApplyConfig() {
 	g_mfActive.store(g_config.mfBonus);
 	g_discountActive.store(g_config.discount);
+	g_bovineRangeActive.store(g_config.bovineRange);
 }
 
 const Setting* FindSetting(const char* section, const char* key) {
@@ -397,53 +403,58 @@ using NextInRoomFn   = Unit* (*)(Unit* unit);
 using FindSpotFn     = int32_t (*)(Game* game, Room* room, int32_t* xy, int32_t radius, int32_t collision, Room** found, int32_t a, int32_t b);
 using MakePortalFn   = int32_t (*)(Game* game, Unit* player, Room* room, int32_t x, int32_t y, int32_t level, void* zero, int32_t objectClass, int32_t c, int32_t d);
 using GameQuestSetFn = void (*)(Game* game, int32_t quest, int32_t flag);
+using PetRangeFn     = uint64_t (*)(Game* game, Unit* player, void* petList, int32_t distanceSquared);
 
 struct EngineFunction {
 	const char* name;
 	uint32_t    rva;
 	uint8_t     entry[12];
 	uint8_t     size; // bytes of entry to check
+	uint8_t     later[12]; // the 12 bytes at rva + 0x20, checked instead when the entry is another plugin's hook
 };
+constexpr uint32_t kLaterOffset = 0x20;
 
 enum : int {
 	kBroadcast, kPlayerCount, kOpenCow, kGameQuestGet, kPlayerData, kQuestGet, kIterPlayers, kUnitRoom, kRoomLevel, kFindUnit, kUnitOwner, kCreatePet,
 	kPetToClient, kPlayerClient, kPetFinish, kOwnerValue, kCorpseOk, kCorpseOk2, kUnitPos, kKill, kRoomForget, kRemoveUnit, kGetStat,
-	kNextInRoom, kFindSpot, kMakePortal, kGameQuestSet, kSetStat, kMaxLife, kFunctionCount
+	kNextInRoom, kFindSpot, kMakePortal, kGameQuestSet, kSetStat, kMaxLife, kPetRange, kFunctionCount
 };
 
 const EngineFunction kFunctions[kFunctionCount] = {
-	{ "Broadcast", 0x4f2390, { 0x4c, 0x8b, 0xc2, 0x45, 0x33, 0xc9, 0x48, 0x8d, 0x15, 0x13, 0x00, 0x00 }, 12 },
-	{ "PlayerCount", 0x4251e0, { 0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x4c, 0x8d, 0x44, 0x24, 0x30, 0xc7 }, 12 },
-	{ "OpenCowPortal", 0x5da2a0, { 0x48, 0x89, 0x5c, 0x24, 0x08, 0x55, 0x56, 0x57, 0x48, 0x83, 0xec, 0x50 }, 12 },
-	{ "GameQuestGet", 0x514fd0, { 0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48 }, 12 },
-	{ "PlayerData", 0x34b240, { 0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xd9, 0x48, 0x85, 0xc9 }, 12 },
-	{ "QuestGet", 0x325c50, { 0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48 }, 12 },
-	{ "IterPlayers", 0x490d00, { 0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x6c, 0x24, 0x18, 0x48, 0x89 }, 12 },
-	{ "UnitRoom", 0x34b440, { 0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xd9, 0x48, 0x85, 0xc9 }, 12 },
-	{ "RoomLevel", 0x2efc10, { 0x48, 0x85, 0xc9, 0x75, 0x03, 0x33, 0xc0, 0xc3, 0x48, 0x8b, 0x49, 0x18 }, 12 },
-	{ "FindUnit", 0x48fe80, { 0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48 }, 12 },
-	{ "UnitOwner", 0x4a53c0, { 0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xd9, 0xe8, 0x02, 0x66 }, 12 },
-	{ "CreatePet", 0x4350e0, { 0x48, 0x89, 0x5c, 0x24, 0x18, 0x48, 0x89, 0x6c, 0x24, 0x20, 0x56, 0x57 }, 12 },
-	{ "PetToClient", 0x480ad0, { 0x48, 0x89, 0x5c, 0x24, 0x18, 0x55, 0x56, 0x57, 0x48, 0x83, 0xec, 0x50 }, 12 },
-	{ "PlayerClient", 0x48fde0, { 0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xd9, 0x48, 0x85, 0xc9 }, 12 },
-	{ "PetFinish", 0x58d950, { 0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x6c, 0x24, 0x18, 0x48, 0x89 }, 12 },
-	{ "OwnerValue", 0x34b8b0, { 0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xd9, 0x48, 0x85, 0xc9 }, 12 },
-	{ "CorpseRevivable", 0x3501e0, { 0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xd9, 0x48, 0x85, 0xc9 }, 12 },
-	{ "CorpseHasBody", 0x33a9a0, { 0x40, 0x57, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xf9, 0xe8, 0x32, 0x52 }, 12 },
-	{ "UnitPos", 0x34a040, { 0x48, 0x89, 0x5c, 0x24, 0x10, 0x57, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b }, 12 },
-	{ "Kill", 0x44db20, { 0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x10, 0x48, 0x89 }, 12 },
-	{ "RoomForget", 0x2ef4d0, { 0x48, 0x85, 0xc9, 0x74, 0x69, 0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89 }, 12 },
-	{ "RemoveUnit", 0x48faa0, { 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b }, 12 },
+	{ "Broadcast", 0x4f2390, { 0x4c, 0x8b, 0xc2, 0x45, 0x33, 0xc9, 0x48, 0x8d, 0x15, 0x13, 0x00, 0x00 }, 12, { 0xe9, 0x5b, 0xe1, 0xf8, 0xff, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc } },
+	{ "PlayerCount", 0x4251e0, { 0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x4c, 0x8d, 0x44, 0x24, 0x30, 0xc7 }, 12, { 0x06, 0x00, 0x0f, 0xb6, 0x8b, 0x01, 0x01, 0x00, 0x00, 0x8b, 0x54, 0x24 } },
+	{ "OpenCowPortal", 0x5da2a0, { 0x48, 0x89, 0x5c, 0x24, 0x08, 0x55, 0x56, 0x57, 0x48, 0x83, 0xec, 0x50 }, 12, { 0x85, 0xc0, 0x0f, 0x85, 0x48, 0x01, 0x00, 0x00, 0x80, 0xbb, 0x06, 0x01 } },
+	{ "GameQuestGet", 0x514fd0, { 0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48 }, 12, { 0x14, 0x48, 0x8d, 0x4c, 0x24, 0x30, 0xc6, 0x44, 0x24, 0x30, 0x00, 0xe8 } },
+	{ "PlayerData", 0x34b240, { 0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xd9, 0x48, 0x85, 0xc9 }, 12, { 0xcc, 0x83, 0x3b, 0x00, 0x74, 0x14, 0x48, 0x8d, 0x4c, 0x24, 0x30, 0xc6 } },
+	{ "QuestGet", 0x325c50, { 0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48 }, 12, { 0x48, 0x8d, 0x4c, 0x24, 0x38, 0xe8, 0x96, 0xfb, 0xff, 0xff, 0x84, 0xc0 } },
+	{ "IterPlayers", 0x490d00, { 0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x6c, 0x24, 0x18, 0x48, 0x89 }, 12, { 0x8b, 0xe8, 0x48, 0x8b, 0xf2, 0x48, 0x8b, 0xf9, 0x48, 0x85, 0xc9, 0x74 } },
+	{ "UnitRoom", 0x34b440, { 0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xd9, 0x48, 0x85, 0xc9 }, 12, { 0xcc, 0x8b, 0x0b, 0x83, 0xe9, 0x02, 0x74, 0x25, 0x83, 0xe9, 0x02, 0x74 } },
+	{ "RoomLevel", 0x2efc10, { 0x48, 0x85, 0xc9, 0x75, 0x03, 0x33, 0xc0, 0xc3, 0x48, 0x8b, 0x49, 0x18 }, 12, { 0x48, 0x85, 0xc9, 0x75, 0x03, 0x33, 0xc0, 0xc3, 0x48, 0x8b, 0x49, 0x18 } },
+	{ "FindUnit", 0x48fe80, { 0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48 }, 12, { 0x48, 0x8d, 0x4c, 0x24, 0x38, 0xe8, 0x46, 0xd1, 0xff, 0xff, 0x84, 0xc0 } },
+	{ "UnitOwner", 0x4a53c0, { 0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xd9, 0xe8, 0x02, 0x66 }, 12, { 0xec, 0x65, 0xea, 0xff, 0x83, 0xf8, 0x01, 0x74, 0x19, 0x48, 0x8d, 0x4c } },
+	{ "CreatePet", 0x4350e0, { 0x48, 0x89, 0x5c, 0x24, 0x18, 0x48, 0x89, 0x6c, 0x24, 0x20, 0x56, 0x57 }, 12, { 0x8b, 0xe9, 0x74, 0x0c, 0x44, 0x8b, 0x72, 0x1c, 0x8b, 0x5a, 0x20, 0xe9 } },
+	{ "PetToClient", 0x480ad0, { 0x48, 0x89, 0x5c, 0x24, 0x18, 0x55, 0x56, 0x57, 0x48, 0x83, 0xec, 0x50 }, 12, { 0xe9, 0x48, 0x85, 0xd2, 0x75, 0x13, 0x48, 0x8d, 0x4c, 0x24, 0x20, 0x88 } },
+	{ "PlayerClient", 0x48fde0, { 0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xd9, 0x48, 0x85, 0xc9 }, 12, { 0x8b, 0x80, 0xf0, 0x00, 0x00, 0x00, 0x48, 0x83, 0xc4, 0x20, 0x5b, 0xc3 } },
+	{ "PetFinish", 0x58d950, { 0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x6c, 0x24, 0x18, 0x48, 0x89 }, 12, { 0x48, 0x85, 0xc9, 0x74, 0x05, 0x48, 0x85, 0xd2, 0x75, 0x26, 0x48, 0x8d } },
+	{ "OwnerValue", 0x34b8b0, { 0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xd9, 0x48, 0x85, 0xc9 }, 12, { 0xcc, 0x8b, 0x83, 0x30, 0x01, 0x00, 0x00, 0x48, 0x83, 0xc4, 0x20, 0x5b } },
+	{ "CorpseRevivable", 0x3501e0, { 0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xd9, 0x48, 0x85, 0xc9 }, 12, { 0xcc, 0x33, 0xc0, 0x48, 0x83, 0xc4, 0x20, 0x5b, 0xc3, 0x83, 0x39, 0x01 } },
+	{ "CorpseHasBody", 0x33a9a0, { 0x40, 0x57, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xf9, 0xe8, 0x32, 0x52 }, 12, { 0xfc, 0x4d, 0x9c, 0x01, 0x48, 0x8b, 0xcf, 0xe8, 0x94, 0xee, 0x00, 0x00 } },
+	{ "UnitPos", 0x34a040, { 0x48, 0x89, 0x5c, 0x24, 0x10, 0x57, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b }, 12, { 0xc5, 0xff, 0xff, 0x84, 0xc0, 0x74, 0x01, 0xcc, 0x48, 0x85, 0xff, 0x75 } },
+	{ "Kill", 0x44db20, { 0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x10, 0x48, 0x89 }, 12, { 0xca, 0x49, 0x8b, 0xf8, 0x48, 0x8b, 0xda, 0x45, 0x32, 0xff, 0xe8, 0x81 } },
+	{ "RoomForget", 0x2ef4d0, { 0x48, 0x85, 0xc9, 0x74, 0x69, 0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89 }, 12, { 0x00, 0xe8, 0x8a, 0x17, 0x73, 0x00, 0xba, 0x10, 0x00, 0x00, 0x00, 0x48 } },
+	{ "RemoveUnit", 0x48faa0, { 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b }, 12, { 0xde, 0xff, 0xff, 0x84, 0xc0, 0x74, 0x01, 0xcc, 0x48, 0x85, 0xff, 0x75 } },
 	// stat reader: a jump thunk into D2RCore, only the opcode is checked
 	{ "GetStat", 0x2f5020, { 0xff, 0x25 }, 2 },
 	// what the cow portal routine does after it has picked the place (0x5da34f)
-	{ "NextInRoom", 0x34b4a0, { 0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xd9, 0x48, 0x85, 0xc9 }, 12 },
-	{ "FindFreeSpot", 0x517f90, { 0x48, 0x89, 0x5c, 0x24, 0x08, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55 }, 12 },
-	{ "MakePortal", 0x432ce0, { 0x48, 0x8b, 0xc4, 0x48, 0x89, 0x68, 0x20, 0x56, 0x57, 0x41, 0x55, 0x41 }, 12 },
-	{ "GameQuestSet", 0x5181c0, { 0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48 }, 12 },
+	{ "NextInRoom", 0x34b4a0, { 0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xd9, 0x48, 0x85, 0xc9 }, 12, { 0xcc, 0x48, 0x8b, 0x83, 0x60, 0x01, 0x00, 0x00, 0x48, 0x83, 0xc4, 0x20 } },
+	{ "FindFreeSpot", 0x517f90, { 0x48, 0x89, 0x5c, 0x24, 0x08, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55 }, 12, { 0xc4, 0x48, 0x89, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x8c } },
+	{ "MakePortal", 0x432ce0, { 0x48, 0x8b, 0xc4, 0x48, 0x89, 0x68, 0x20, 0x56, 0x57, 0x41, 0x55, 0x41 }, 12, { 0x85, 0xc9, 0x75, 0x11, 0x88, 0x48, 0x08, 0x48, 0x8d, 0x48, 0x08, 0xe8 } },
+	{ "GameQuestSet", 0x5181c0, { 0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48 }, 12, { 0x14, 0x48, 0x8d, 0x4c, 0x24, 0x30, 0xc6, 0x44, 0x24, 0x30, 0x00, 0xe8 } },
 	{ "SetStat", 0x2f7d10, { 0xff, 0x25 }, 2 },
 	// a unit's full max life, read by the summon skills before they add their life bonus (0x55f35f)
 	{ "MaxLife", 0x2f4d20, { 0xff, 0x25 }, 2 },
+	// what the game does with a "range" pet type's pets when their owner warps (called at 0x500caf)
+	{ "PetRange", 0x501920, { 0x40, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x48, 0x83, 0xec, 0x28, 0x49 }, 12, { 0x48, 0x89, 0x5c, 0x24, 0x50, 0x48, 0x89, 0x6c, 0x24, 0x58, 0x4c, 0x89 } },
 };
 bool g_functionOk[kFunctionCount] = {};
 
@@ -527,21 +538,29 @@ constexpr int kMaxMinions = 64;
 Minion        g_minions[kMaxMinions];
 int           g_minionCount = 0;
 
-// players given their base Magic Find in this game (and how much)
-struct MfGiven {
+// The base stats every player is given in each game: Magic Find (stat 80) and "Reduces all
+// Vendor Prices" (stat 87). For each: the players who have it in this game (and how much), and
+// what the character screen's copy of the local player should show.
+struct StatGiven {
 	uint32_t id;
 	int32_t  value;
 };
 constexpr int kMaxPlayers = 16;
-MfGiven       g_mfGiven[kMaxPlayers];
-int           g_mfGivenCount = 0;
+struct BaseStat {
+	uint32_t              stat;
+	std::atomic<int>*     active;                      // the setting
+	StatGiven             given[kMaxPlayers] {};
+	int                   givenCount = 0;
+	std::atomic<int32_t>  serverTotal { INT32_MIN };   // the server copy's total, gear included (INT32_MIN = not known)
+	std::atomic<int32_t>  clientValue { 0 };           // the base the client's copy should have
+	int32_t               askedValue = INT32_MIN;      // server thread: what the last look was for
+};
+BaseStat g_baseStats[2] = { { 80, &g_mfActive }, { 87, &g_discountActive } };
 
-// The character screen's copy of the player (see "base Magic Find" below) is looked at when its
+// The character screen's copy of the player (see "base stats" below) is looked at when a
 // value changes and otherwise at most every 10 seconds.
 constexpr uint32_t   kClientLookFrames = 10 * 25;
-std::atomic<int32_t> g_serverMfTotal { INT32_MIN }; // the server copy's Magic Find, gear included (INT32_MIN = not known)
-uint32_t             g_clientAskedId    = 0xffffffffu; // server thread: what the last look was for...
-int32_t              g_clientAskedValue = INT32_MIN;
+uint32_t             g_clientAskedId    = 0xffffffffu; // server thread: the player the last look was for...
 uint32_t             g_clientNextLook   = 0;           // ...and the game frame of the next one
 
 
@@ -550,14 +569,16 @@ void ResetGameState(Game* game) {
 	g_cloneSlot    = INT64_MIN; // as online: only a game running when a mark passes gets him
 	g_cowDone      = false;
 	g_cowSearches  = 0;
-	g_mfGivenCount = 0;
+	for (BaseStat& base : g_baseStats) {
+		base.givenCount  = 0;
+		base.serverTotal = INT32_MIN;
+		base.askedValue  = INT32_MIN;
+	}
 	g_pendingCount = 0;
 	g_minionCount  = 0;
 	g_bovinesAlive = 0;
-	g_serverMfTotal    = INT32_MIN;
-	g_clientAskedId    = 0xffffffffu; // the new game's player is looked at in its first second
-	g_clientAskedValue = INT32_MIN;
-	g_clientNextLook   = 0;
+	g_clientAskedId  = 0xffffffffu; // the new game's player is looked at in its first second
+	g_clientNextLook = 0;
 }
 
 // ---------------------------------------------------------------- Diablo Clone
@@ -715,6 +736,9 @@ void CowTick(Game* game) {
 
 // ---------------------------------------------------------------- Hell Bovine Minions
 
+bool SafeReadBytes(uintptr_t address, void* out, size_t size);
+bool g_ownKill = false; // the plugin's own "time is up" kill is under way (see KillHook)
+
 // The player a kill belongs to: the killer itself, or the owner of the pet, mercenary or
 // missile that made it.
 Unit* KillOwner(Game* game, const D2RL::Lifecycle::UnitIdentity& killer) {
@@ -830,7 +854,9 @@ void BovineTick(Game* game) {
 			++g_bovinesFellEarly;
 		}
 		if (!drop && static_cast<int32_t>(frame - g_minions[i].until) >= 0) {
+			g_ownKill = true;
 			Engine<KillFn>(kKill)(game, unit, nullptr, 0); // they fall after their time
+			g_ownKill = false;
 			drop = true;
 		}
 		if (drop) {
@@ -842,18 +868,84 @@ void BovineTick(Game* game) {
 	g_bovinesAlive = g_minionCount;
 }
 
-// ---------------------------------------------------------------- base Magic Find
+// Why a Hell Bovine fell before its time: the game's kill routine (0x44db20) is watched, and when
+// its victim is a Hell Bovine Minion that this plugin did not kill itself, one line goes to the
+// log: its age, life, the killer, and the game code the kill came from (return addresses found
+// on the stack, as offsets in the game image). Nothing is changed; the kill goes on as it was.
+KillFn            g_originalKill = nullptr;
+std::atomic<int>  g_killsLogged { 0 };
+constexpr int     kMaxKillLines = 200;
 
+void KillHook(Game* game, Unit* victim, Unit* killer, int32_t flag) {
+	if (!g_ownKill && game != nullptr && victim != nullptr && g_minionFromMod && UnitType(victim) == 1 && UnitClass(victim) == static_cast<uint32_t>(g_hellBovineClass)
+		&& g_killsLogged.load() < kMaxKillLines) {
+		++g_killsLogged;
+		const uint32_t id    = UnitId(victim);
+		const uint32_t frame = GameFrame(game);
+		int            age   = -1;
+		for (int i = 0; i < g_minionCount; ++i) {
+			if (g_minions[i].id == id) {
+				age = static_cast<int>(frame - (g_minions[i].until - static_cast<uint32_t>(g_config.bovineLife) * kFps));
+			}
+		}
+		const int32_t life    = g_functionOk[kGetStat] ? Engine<StatFn>(kGetStat)(victim, 6, 0) >> 8 : -1;
+		const int32_t maxLife = g_functionOk[kMaxLife] ? Engine<MaxLifeFn>(kMaxLife)(victim) >> 8 : -1;
+		char          from[400] = "";
+		size_t        used      = 0;
+		uintptr_t     stack[256] = {};
+		const uintptr_t top = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
+		if (SafeReadBytes(top, stack, sizeof(stack))) {
+			int found = 0;
+			for (uintptr_t value : stack) {
+				if (value > g_base + 0x1000 && value < g_base + 0x1c00000 && found < 14 && used + 12 < sizeof(from)) {
+					used += static_cast<size_t>(snprintf(from + used, sizeof(from) - used, " %llx", static_cast<unsigned long long>(value - g_base)));
+					++found;
+				}
+			}
+		}
+		Log("hell bovine %u killed at frame %u, %s%d frames after rising (mode %u, life %d of %d, kill flag %d) by %s (type %u class %u id %u); from game code:%s", id, frame,
+			age < 0 ? "not yet listed, " : "", age < 0 ? 0 : age, UnitMode(victim), life, maxLife, flag, killer == nullptr ? "no one" : "a unit", killer != nullptr ? UnitType(killer) : 0,
+			killer != nullptr ? UnitClass(killer) : 0, killer != nullptr ? UnitId(killer) : 0, from);
+	}
+	g_originalKill(game, victim, killer, flag);
+}
+
+// When a player warps (Teleport, a waypoint, a portal, stairs) the game goes through the
+// player's pets by pet type (0x500a40). For a "range" type such as the traps, the hydras and the
+// Hell Bovine Minions it calls 0x501920(game, player, that type's pet list, 0x640) from 0x500caf:
+// each pet whose squared distance from where the player arrived is over 0x640 (40 steps) is
+// removed. That one call comes here: for the Hell Bovines' list the distance is the setting's,
+// for every other list it is passed on as the game gave it.
+// The list is {first node, ...}; a node holds the pet's unit id at +4 and the next node at +0x18.
+uint64_t PetRangeHook(Game* game, Unit* player, void* petList, int32_t distanceSquared) {
+	if (game != nullptr && petList != nullptr && g_minionFromMod && g_functionOk[kFindUnit]) {
+		const char* node = *reinterpret_cast<const char* const*>(petList);
+		if (node != nullptr) {
+			Unit* pet = Engine<FindUnitFn>(kFindUnit)(game, 1, *reinterpret_cast<const uint32_t*>(node + 4));
+			if (pet != nullptr && UnitClass(pet) == static_cast<uint32_t>(g_hellBovineClass)) {
+				const int64_t steps = 40ll * g_bovineRangeActive.load(std::memory_order_relaxed) / 100;
+				distanceSquared     = static_cast<int32_t>(steps * steps);
+			}
+		}
+	}
+	return Engine<PetRangeFn>(kPetRange)(game, player, petList, distanceSquared);
+}
+
+// ---------------------------------------------------------------- base stats (Magic Find, vendor prices)
+
+// Every player gets a base Magic Find (stat 80) and a base "Reduces all Vendor Prices" (stat 87)
+// at the start of each game, on the base layer, as if the character had them without gear: the
+// drop code and the price code then read them as they read the gear's, and they show on the
+// character screen. Neither stat is saved with a character, so nothing is written to the save.
 // The character screen shows the client's copy of the player, and the server does not send
-// stat 80 to it, so the client's copy gets the same base value (on the UI thread). The client
+// these stats to it, so the client's copy gets the same base values (on the UI thread). The client
 // keeps its players in a table of 128 lists at 0x2a23910 (next unit at +0x158), as found for
 // Horrors in the Night; the copy has the same unit id as the server's.
 // The game can make a new copy of the player (at the same place in memory, too), so the copy is
-// not taken at its word once written: each look compares its Magic Find, gear included, with the
+// not taken at its word once written: each look compares each stat, gear included, with the
 // server copy's, and puts the base back when they differ.
 const D2RL::ThreadService* g_threads = nullptr;
 std::atomic<uint32_t>      g_clientMfId { 0xffffffffu };
-std::atomic<int32_t>       g_clientMfValue { 0 };
 std::atomic<bool>          g_clientJobQueued { false };
 std::atomic<int>           g_clientWrites { 0 }; // times the copy was given its base, for the console
 uintptr_t                  g_clientPlayer = 0;   // UI thread only
@@ -887,9 +979,7 @@ uintptr_t FindClientPlayer(uint32_t id) {
 
 void __cdecl ClientMfJob(const D2RL::PluginContext*, void*) noexcept {
 	g_clientJobQueued = false;
-	const uint32_t id    = g_clientMfId.load();
-	const int32_t  value = g_clientMfValue.load();
-	const int32_t  total = g_serverMfTotal.load();
+	const uint32_t id = g_clientMfId.load();
 	if (id == 0xffffffffu) {
 		return;
 	}
@@ -901,23 +991,29 @@ void __cdecl ClientMfJob(const D2RL::PluginContext*, void*) noexcept {
 		return;
 	}
 	Unit* const client = reinterpret_cast<Unit*>(g_clientPlayer);
-	// Without the server's total to compare with, the base is written at every look.
-	const bool known = total != INT32_MIN && g_functionOk[kGetStat];
-	if (!known || Engine<StatFn>(kGetStat)(client, 80, 0) != total) {
-		Engine<SetStatFn>(kSetStat)(client, 80, value, 0);
-		++g_clientWrites;
+	for (BaseStat& base : g_baseStats) {
+		const int32_t value = base.clientValue.load();
+		const int32_t total = base.serverTotal.load();
+		// Without the server's total to compare with, the base is written at every look.
+		const bool known = total != INT32_MIN && g_functionOk[kGetStat];
+		if (!known || Engine<StatFn>(kGetStat)(client, base.stat, 0) != total) {
+			Engine<SetStatFn>(kSetStat)(client, base.stat, value, 0);
+			++g_clientWrites;
+		}
 	}
 }
 
 // Server thread, once a second: a look at the client's copy when what it should show changed (a
-// new game, the setting), else when the last look is 10 seconds old.
+// new game, a setting), else when the last look is 10 seconds old.
 void QueueClientMf(uint32_t frame) {
-	const uint32_t id    = g_clientMfId.load();
-	const int32_t  value = g_clientMfValue.load();
+	const uint32_t id = g_clientMfId.load();
 	if (g_threads == nullptr || id == 0xffffffffu) {
 		return;
 	}
-	const bool changed = id != g_clientAskedId || value != g_clientAskedValue;
+	bool changed = id != g_clientAskedId;
+	for (BaseStat& base : g_baseStats) {
+		changed = changed || base.clientValue.load() != base.askedValue;
+	}
 	if (!changed && static_cast<int32_t>(frame - g_clientNextLook) < 0) {
 		return;
 	}
@@ -928,41 +1024,45 @@ void QueueClientMf(uint32_t frame) {
 		g_clientJobQueued = false;
 		return;
 	}
-	g_clientAskedId    = id;
-	g_clientAskedValue = value;
-	g_clientNextLook   = frame + kClientLookFrames;
+	g_clientAskedId = id;
+	for (BaseStat& base : g_baseStats) {
+		base.askedValue = base.clientValue.load();
+	}
+	g_clientNextLook = frame + kClientLookFrames;
 }
 
 void MfPlayer(Game*, Unit* player, void*) {
 	if (player == nullptr) {
 		return;
 	}
-	const int32_t value = g_mfActive.load(std::memory_order_relaxed);
-	const uint32_t id   = UnitId(player);
-	if (g_clientMfId.load() == 0xffffffffu || g_mfGivenCount == 0) {
+	const uint32_t id = UnitId(player);
+	if (g_clientMfId.load() == 0xffffffffu || g_baseStats[0].givenCount == 0) {
 		g_clientMfId = id; // the first player of the game is the one playing here
 	}
 	const bool local = g_clientMfId.load() == id;
-	if (local) {
-		g_clientMfValue = value;
-	}
-	bool known = false;
-	for (int i = 0; i < g_mfGivenCount && !known; ++i) {
-		if (g_mfGiven[i].id == id) {
-			known = true;
-			if (g_mfGiven[i].value != value) {
-				Engine<SetStatFn>(kSetStat)(player, 80, value, 0);
-				g_mfGiven[i].value = value;
+	for (BaseStat& base : g_baseStats) {
+		const int32_t value = base.active->load(std::memory_order_relaxed);
+		if (local) {
+			base.clientValue = value;
+		}
+		bool known = false;
+		for (int i = 0; i < base.givenCount && !known; ++i) {
+			if (base.given[i].id == id) {
+				known = true;
+				if (base.given[i].value != value) {
+					Engine<SetStatFn>(kSetStat)(player, base.stat, value, 0);
+					base.given[i].value = value;
+				}
 			}
 		}
-	}
-	if (!known && g_mfGivenCount < kMaxPlayers) {
-		Engine<SetStatFn>(kSetStat)(player, 80, value, 0);
-		g_mfGiven[g_mfGivenCount++] = { id, value };
-	}
-	// what the character screen should show: the server copy's Magic Find with the gear
-	if (local && g_functionOk[kGetStat]) {
-		g_serverMfTotal = Engine<StatFn>(kGetStat)(player, 80, 0);
+		if (!known && base.givenCount < kMaxPlayers) {
+			Engine<SetStatFn>(kSetStat)(player, base.stat, value, 0);
+			base.given[base.givenCount++] = { id, value };
+		}
+		// what the character screen should show: the server copy's total with the gear
+		if (local && g_functionOk[kGetStat]) {
+			base.serverTotal = Engine<StatFn>(kGetStat)(player, base.stat, 0);
+		}
 	}
 }
 
@@ -1000,11 +1100,7 @@ uint64_t TickHook(Game* game) {
 	return result;
 }
 
-// ---------------------------------------------------------------- Magic Find and vendors
-
-int32_t PriceStatHook(Unit* unit, uint32_t stat, uint32_t layer) {
-	return Engine<StatFn>(kGetStat)(unit, stat, layer) + g_discountActive.load(std::memory_order_relaxed);
-}
+// ---------------------------------------------------------------- redirected calls
 
 // Replaces the 5-byte call at `site` with a call to a 14-byte absolute jump written into
 // int3 padding at `cave`, which goes to `target`. Both places are checked first.
@@ -1128,21 +1224,47 @@ void LoadModInfo() {
 
 const uint8_t kTickEntry[16] = { 0x40, 0x55, 0x56, 0x48, 0x83, 0xec, 0x38, 0x48, 0x8b, 0xe9, 0x33, 0xf6, 0x0f, 0xb6, 0x89, 0x06 };
 constexpr uint32_t kTickRva = 0x488310;
+const uint8_t kKillEntry[16] = { 0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57 }; // 0x44db20
 
 // the clone code this plugin relies on, checked rather than assumed
 const uint8_t kCloneSpawnCheck[10] = { 0x41, 0x83, 0xbe, 0xd4, 0xa5, 0x01, 0x00, 0x01, 0x75, 0x44 }; // 0x499c99: cmp [game+0x1a5d4],1
-const uint8_t kPriceSite[5] = { 0xe8, 0xf0, 0x5d, 0xf8, 0xff }; // 0x36f22b: call 0x2f5020 (stat 87)
-constexpr uint32_t kCavePrice = 0x3ecd80;
+const uint8_t kRangeSite[5] = { 0xe8, 0x6c, 0x0c, 0x00, 0x00 }; // 0x500caf: call 0x501920 (range pets on a warp)
+constexpr uint32_t kCaveRange = 0x3ecd60;
+
+// A routine is the expected one when its first bytes match. Another plugin's hook replaces those
+// bytes with a jump (and passes the call on to the routine), so when they are a jump the bytes
+// 0x20 further in are compared instead: the same game, hooked, is still used.
+bool IsJump(const uint8_t* code) {
+	return code[0] == 0xe9 || code[0] == 0xeb || (code[0] == 0xff && code[1] == 0x25) || (code[0] == 0x48 && code[1] == 0xb8) || (code[0] == 0x49 && code[1] == 0xbb)
+		|| (code[0] == 0x68) || (code[0] == 0x48 && code[1] == 0xff && code[2] == 0x25);
+}
+
+bool FunctionMatches(const EngineFunction& function, bool& hooked) {
+	const uint8_t* code = reinterpret_cast<const uint8_t*>(g_base + function.rva);
+	hooked              = false;
+	if (memcmp(code, function.entry, function.size) == 0) {
+		return true;
+	}
+	if (function.size == 12 && IsJump(code) && memcmp(code + kLaterOffset, function.later, sizeof(function.later)) == 0) {
+		hooked = true;
+		return true;
+	}
+	return false;
+}
 
 bool g_priceReady = false;
+bool g_rangeReady = false;
 
 void SetUp() {
 	int missing = 0;
 	for (int i = 0; i < kFunctionCount; ++i) {
-		g_functionOk[i] = g_ctx->CheckExpectedBytes(kFunctions[i].rva, kFunctions[i].entry, kFunctions[i].size);
+		bool hooked     = false;
+		g_functionOk[i] = FunctionMatches(kFunctions[i], hooked);
 		if (!g_functionOk[i]) {
 			Log("engine: %s (0x%x) is not the expected code", kFunctions[i].name, kFunctions[i].rva);
 			++missing;
+		} else if (hooked) {
+			Log("engine: %s (0x%x) is hooked by another plugin - used through its hook", kFunctions[i].name, kFunctions[i].rva);
 		}
 	}
 	const D2RL::PluginApi* api = g_ctx->GetApi();
@@ -1151,6 +1273,15 @@ void SetUp() {
 	const bool tickOk = api != nullptr && D2RL::ApiInstallInlineHook(api) != nullptr && D2RL::ApiInstallInlineHook(api)(g_ctx, &hook) && g_originalTick != nullptr;
 	if (!tickOk) {
 		Log("server tick: hook failed - Diablo Clone, Cow Portal and Hell Bovines are off");
+	}
+	// the kill routine, watched for the log only (see KillHook); the Hell Bovines work without it
+	if (tickOk && g_functionOk[kKill]) {
+		D2RL::InlineHookRegistration killHook = D2RL::MakeInlineHook(kFunctions[kKill].rva, kKillEntry, sizeof(kKillEntry), reinterpret_cast<void*>(&KillHook),
+			reinterpret_cast<void**>(&g_originalKill));
+		if (!D2RL::ApiInstallInlineHook(api)(g_ctx, &killHook) || g_originalKill == nullptr) {
+			g_originalKill = nullptr;
+			Log("hell bovines: the kill routine could not be watched (no 'killed' lines in this log)");
+		}
 	}
 	g_cloneReady  = tickOk && Have({ kBroadcast, kPlayerCount }) && g_ctx->CheckExpectedBytes(0x499c99, kCloneSpawnCheck, sizeof(kCloneSpawnCheck));
 	g_cowReady    = tickOk && Have({ kOpenCow, kGameQuestGet, kPlayerData, kQuestGet, kIterPlayers, kUnitRoom, kRoomLevel, kNextInRoom, kFindSpot, kMakePortal, kGameQuestSet, kUnitPos });
@@ -1181,7 +1312,14 @@ void SetUp() {
 		g_threads = nullptr;
 		Log("magic find: the loader's UI thread service is missing - the base Magic Find works but may not show on the character screen");
 	}
-	g_priceReady = Have({ kGetStat }) && RedirectCall("vendors", 0x36f22b, kPriceSite, kCavePrice, reinterpret_cast<void*>(&PriceStatHook));
+	g_priceReady = g_mfReady; // the vendor discount is a base stat, given with the Magic Find
+
+	// only with the mod's own pet type: the fallback (Revive's) is a "warp" type and never gets here
+	g_rangeReady = g_bovineReady && g_minionFromMod && Have({ kPetRange })
+		&& RedirectCall("hell bovine range", 0x500caf, kRangeSite, kCaveRange, reinterpret_cast<void*>(&PetRangeHook));
+	if (g_bovineReady && !g_rangeReady) {
+		Log("hell bovines: the warp distance setting is off (they keep the game's 40 steps)");
+	}
 
 	Log("ready: diablo clone %s, cow portal %s, hell bovines %s, magic find %s, vendors %s (%d engine functions not found)", g_cloneReady ? "on" : "OFF", g_cowReady ? "on" : "OFF",
 		g_bovineReady ? "on" : "OFF", g_mfReady ? "on" : "OFF", g_priceReady ? "on" : "OFF", missing);
@@ -1199,7 +1337,7 @@ D2RL::ConsoleCommandResult __cdecl OnConsole(D2R::Game::Client*, const D2RL::Con
 	while (*rest == ' ') {
 		++rest;
 	}
-	char text[600];
+	char text[700];
 	if (strncmp(rest, "clone", 5) == 0) {
 		g_requestClone = 1;
 		g_ctx->WriteConsoleMessage("Legacy of Terror: Diablo Clone asked for - in a Hell game he takes the next Super Unique's place.");
@@ -1212,10 +1350,10 @@ D2RL::ConsoleCommandResult __cdecl OnConsole(D2R::Game::Client*, const D2RL::Con
 		const char*   clone  = g_lastCloneResult == 1 ? "pending/spawned" : g_lastCloneResult == 2 ? "last mark: not a Hell game" : g_lastCloneResult == 3 ? "last mark: already had him"
 			: g_lastCloneResult == 4 ? "last mark: no players" : "none yet";
 		snprintf(text, sizeof(text),
-			"Legacy of Terror: diablo clone %s (next in %lldh %02lldm, %s, %d so far), cow portal %s (%d opened), hell bovines %s (%d%%, %ds, +%d%% life, %d raised, %d up, %d slain early), base magic find %s (%d%%, character screen set %dx), vendors %s (-%d%%). Commands: terror clone | cows",
+			"Legacy of Terror: diablo clone %s (next in %lldh %02lldm, %s, %d so far), cow portal %s (%d opened), hell bovines %s (%d%%, %ds, +%d%% life, warp distance %d%%%s, %d raised, %d up, %d slain early), base magic find %s (%d%%, character screen set %dx), vendors %s (-%d%%). Commands: terror clone | cows",
 			g_cloneReady && g_config.cloneEnabled ? "on" : "off", static_cast<long long>(wait / 3600), static_cast<long long>((wait / 60) % 60), clone, g_clonesTriggered.load(),
 			g_cowReady && g_config.cowEnabled ? "on" : "off", g_cowPortals.load(), g_bovineReady && g_config.bovineEnabled ? "on" : "off", g_config.bovineChance, g_config.bovineLife,
-			g_config.bovineBonus, g_bovinesRaised.load(), g_bovinesAlive.load(), g_bovinesFellEarly.load(), g_mfReady ? "on" : "off", g_mfActive.load(), g_clientWrites.load(), g_priceReady ? "on" : "off", g_discountActive.load());
+			g_config.bovineBonus, g_config.bovineRange, g_rangeReady ? "" : " (off)", g_bovinesRaised.load(), g_bovinesAlive.load(), g_bovinesFellEarly.load(), g_mfReady ? "on" : "off", g_mfActive.load(), g_clientWrites.load(), g_priceReady ? "on" : "off", g_discountActive.load());
 		g_ctx->WriteConsoleMessage(text);
 	}
 	return D2RL::ConsoleCommandResult::Handled;
@@ -1226,7 +1364,7 @@ constexpr D2RL::PluginInfo kPluginInfo {
 	.abiVersion  = D2RL_PLUGIN_ABI_VERSION,
 	.id          = "legacy-of-terror",
 	.name        = "Legacy of Terror",
-	.version     = "1.0.1",
+	.version     = "1.0.3",
 	.author      = "Latedozer",
 	.description = "Offline copy of the Diablo 30th anniversary event: Diablo Clone every six hours in Hell, a Cow Portal in the Rogue Encampment, +100% Magic Find, 15% off at vendors, and Hell Bovine Minions.",
 	.flags       = D2RL::PluginFlags::Shared | D2RL::PluginFlags::NativeHooks,

@@ -7,3 +7,5 @@ build/
 Release*/
 release-*/
 *.zip
+# local roll-back copies
+backup-before-*/

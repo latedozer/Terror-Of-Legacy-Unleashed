@@ -38,6 +38,11 @@ lifetime_seconds = 60
 # Extra life for each Hell Bovine, in percent (0-400). The game's Revive gives the monsters it
 # raises +200%; the Hell Bovines get the same, or they fall in a few hits among many monsters.
 life_bonus_percent = 200
+# When you warp (Teleport, a waypoint, a portal, stairs) the game removes the Hell Bovines that
+# are too far from where you arrive, as it does with traps and hydras. This is that distance, in
+# percent (100-1000): 100 is the game's own 40 steps (about one screen), 200 is 80, 300 is 120.
+# Only the Hell Bovines are affected.
+range_percent = 200
 
 [magic_find]
 # Every character starts each game with this much Magic Find (0-250), at all difficulties.
@@ -46,6 +51,7 @@ life_bonus_percent = 200
 bonus_percent = 100
 
 [vendors]
-# Added to "Reduces all Vendor Prices" for every player: buying, gambling and repairs.
-# Selling to a vendor is not affected. The game caps the total at 99%.
+# Every character starts each game with this much "Reduces all Vendor Prices" (0-99): buying,
+# gambling and repairs. It shows on the character screen and adds to your gear's; selling to a
+# vendor is not affected. The game caps the total at 99%. Nothing is saved to the character.
 discount_percent = 15
